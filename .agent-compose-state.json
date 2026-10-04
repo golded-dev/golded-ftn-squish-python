@@ -1,0 +1,19 @@
+{
+  "config_sha256": "1296478cf7017b9d827e2a6dbdbf802fdd00c0851d9fa89bcd85a4115a862fc3",
+  "outputs": {
+    "AGENTS.md": {
+      "sha256": "e71b89e1bf87aaf51af77f8bd9237bfcbbc3e094571942dac5eb955f4985a66e",
+      "sources": [
+        {
+          "sha256": "1ebf2a25506c112632c2675deb61164736567c41034a87eeb15223a577a9a1b7",
+          "source": "local:project.md"
+        },
+        {
+          "sha256": "20a58618fd48485cae0526e47a69150049ffa56a1acd8199819ea7559ad826d5",
+          "source": "private:personas/ash.md"
+        }
+      ]
+    }
+  },
+  "version": 1
+}
