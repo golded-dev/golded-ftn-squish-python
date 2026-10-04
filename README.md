@@ -1,5 +1,9 @@
 # golded-ftn-squish
 
+Repository: [`golded-ftn-squish-python`](https://github.com/golded-dev/golded-ftn-squish-python).
+The distribution remains `golded-ftn-squish`; imports use `golded_ftn_squish`.
+The source is public on GitHub. This package has not been released on PyPI.
+
 Strict reader for classic Squish `.SQD` and `.SQI` message areas. Python 3.12+;
 plain Python, using the models and text helpers from `golded-ftn`.
 
@@ -12,8 +16,16 @@ for message in SquishReader().read(base):
     print(message.msgno, message.from_name, message.subject)
 ```
 
-Install with `pip install golded-ftn-squish` once the package is published. In this
-checkout, `uv sync` uses the sibling `../golded-ftn` repository. Wheels and source
+For a local checkout:
+
+```sh
+git clone https://github.com/golded-dev/golded-ftn-python.git
+git clone https://github.com/golded-dev/golded-ftn-squish-python.git
+cd golded-ftn-squish-python
+uv sync --locked
+```
+
+uv uses the sibling `../golded-ftn-python` repository. Wheels and source
 distributions declare only `golded-ftn>=1.1.0,<2`; the development source override
 and lock file are excluded from the sdist.
 
