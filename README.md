@@ -14,7 +14,7 @@ for message in SquishReader().read(base):
 
 Install with `pip install golded-ftn-squish` once the package is published. In this
 checkout, `uv sync` uses the sibling `../golded-ftn` repository. Wheels and source
-distributions declare only `golded-ftn>=1.0.0,<2`; the development source override
+distributions declare only `golded-ftn>=1.1.0,<2`; the development source override
 and lock file are excluded from the sdist.
 
 ## Reading an area
@@ -96,3 +96,30 @@ not copied. Tests use independent synthetic bytes, never private message archive
 
 MIT license. See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) and
 [release instructions](docs/release.md).
+
+## Archive mode
+
+Strict reading remains the default. Archive mode requires a report callback:
+
+```python
+from golded_ftn import ReaderIssue, ReaderOptions
+
+issues: list[ReaderIssue] = []
+options = ReaderOptions(archive_mode=True, on_issue=issues.append)
+# Pass options to SquishReader().read(source, options).
+```
+
+Issues carry `recovered`, `skipped` or `stopped`, the actual filename, record
+identity and physical offset. Their detail contains no message contents. A stop
+means the traversal is incomplete; a validated prefix may still be returned.
+Multiple issues can describe one record, including recovery followed by a skip.
+Filesystem errors and callback exceptions propagate. Files must remain stable.
+
+The index UID wins over a disagreeing header UID and empty SOH control segments
+are ignored, both with reports. Failed indexed frames or messages are skipped
+using the next index slot. Duplicate offsets, overlapping frame extents, invalid
+UID order and truncated indices stop traversal. Metadata conflicts are skipped.
+
+If declared ASCII cannot decode a payload, the configured fallback is tried
+strictly and reported. The original charset control stays unchanged. Other
+decoding failures are skipped; there is no lossy decoding or mojibake repair.

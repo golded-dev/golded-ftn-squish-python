@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0 — Unreleased
+
+Add reported archive reading with index-authoritative UIDs, empty control
+segment recovery and strict ASCII fallback. Bad indexed records are skipped;
+ambiguous index order or overlap stops traversal. Strict reading remains the default.
+
 ## 1.0.0 — 2026-10-04
 
 - Read classic Squish areas through the active index prefix, preserving UIDs.

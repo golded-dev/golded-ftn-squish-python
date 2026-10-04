@@ -5,12 +5,13 @@ import errno
 import re
 import stat
 import struct
+from bisect import bisect_left
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import UTC, datetime
 from os import PathLike
 from pathlib import Path
-from typing import NoReturn
+from typing import Literal, NoReturn
 
 from golded_ftn import (
     ControlLine,
@@ -18,6 +19,7 @@ from golded_ftn import (
     MessageProvenance,
     ParsedMessage,
     ParserException,
+    ReaderIssue,
     ReaderOptions,
     detect_charset,
     parse_body,
@@ -34,10 +36,38 @@ _FRAME = struct.Struct("<IiiIIIHH")
 _MSGUID = 0x20000
 
 
+class _ParseFailure(ParserException):
+    def __init__(self, path: Path, offset: int, error: Exception) -> None:
+        super().__init__(f"Cannot parse Squish file {path} at offset {offset}: {error}")
+        self.path = path
+        self.offset = offset
+
+
 def _fail(path: Path, offset: int, error: Exception) -> NoReturn:
-    raise ParserException(
-        f"Cannot parse Squish file {path} at offset {offset}: {error}"
-    ) from error
+    raise _ParseFailure(path, offset, error) from error
+
+
+def _issue(
+    options: ReaderOptions,
+    path: Path,
+    offset: int,
+    uid: int | None,
+    action: Literal["recovered", "skipped", "stopped"],
+    code: str,
+    detail: str,
+) -> None:
+    assert options.on_issue is not None
+    options.on_issue(
+        ReaderIssue(
+            source_type="squish",
+            source_path=str(path),
+            source_id=str(uid) if uid is not None else None,
+            source_offset=offset,
+            action=action,
+            code=code,
+            detail=detail,
+        )
+    )
 
 
 def _require(condition: bool, path: Path, offset: int, message: str) -> None:
@@ -75,7 +105,13 @@ def _file(base: Path, suffix: str) -> Path:
     return path
 
 
-def _control_records(raw: bytes, path: Path, offset: int) -> list[tuple[bytes, int]]:
+def _control_records(
+    raw: bytes,
+    path: Path,
+    offset: int,
+    options: ReaderOptions,
+    uid: int,
+) -> list[tuple[bytes, int]]:
     first_null = raw.find(b"\x00")
     if first_null >= 0:
         _require(
@@ -91,6 +127,18 @@ def _control_records(raw: bytes, path: Path, offset: int) -> list[tuple[bytes, i
     result: list[tuple[bytes, int]] = []
     position = 0
     for value in raw.split(b"\x01")[1:]:
+        if not value and options.archive_mode:
+            _issue(
+                options,
+                path,
+                offset + position,
+                uid,
+                "recovered",
+                "empty_control_segment",
+                "Ignored an empty control segment",
+            )
+            position += 1
+            continue
         _require(bool(value), path, offset + position, "Empty control record")
         _require(
             b"\r" not in value and b"\n" not in value,
@@ -136,10 +184,34 @@ def _charset(
     return selected or fallback
 
 
-def _decode(raw: bytes, charset: str, path: Path, offset: int) -> str:
+def _decode(
+    raw: bytes,
+    charset: str,
+    path: Path,
+    offset: int,
+    options: ReaderOptions,
+    uid: int,
+) -> str:
     try:
         return to_utf8(raw, charset)
     except UnicodeDecodeError as error:
+        if options.archive_mode and codecs.lookup(charset).name == "ascii":
+            try:
+                decoded = to_utf8(raw, detect_charset(b"", options.fallback_charset))
+            except UnicodeDecodeError as fallback_error:
+                _fail(path, offset + fallback_error.start, fallback_error)
+            except (ValueError, LookupError) as fallback_error:
+                _fail(path, offset, fallback_error)
+            _issue(
+                options,
+                path,
+                offset + error.start,
+                uid,
+                "recovered",
+                "ascii_decode_fallback",
+                f"Decoded ASCII-declared bytes with {options.fallback_charset}",
+            )
+            return decoded
         _fail(path, offset + error.start, error)
     except (ValueError, LookupError) as error:
         _fail(path, offset, error)
@@ -180,9 +252,12 @@ def _controls(
     charset: str,
     path: Path,
     body_offset: int,
+    options: ReaderOptions,
+    uid: int,
 ) -> tuple[MessageControlLines, list[tuple[ControlLine, int]]]:
     decoded_records = [
-        (_decode(raw, charset, path, offset), offset) for raw, offset in records
+        (_decode(raw, charset, path, offset, options, uid), offset)
+        for raw, offset in records
     ]
     header_text = "\n".join(text for text, _offset in decoded_records)
     header_controls = _parse_controls(header_text)
@@ -252,6 +327,39 @@ def _date(raw: int, ftsc: bytes) -> datetime | None:
         return None
 
 
+def _frame(data: bytes, sqd: Path, sqi: Path, position: int, offset: int) -> int:
+    _require(
+        offset >= 256,
+        sqi,
+        position * 12,
+        "Frame offset points into base header",
+    )
+    signature, _next, _prev, length, total, clen, kind, _reserved = _FRAME.unpack(
+        _slice(data, offset, 28, sqd)
+    )
+    _require(signature == 0xAFAE4453, sqd, offset, "Invalid frame signature")
+    _require(
+        kind == 0,
+        sqd,
+        offset + 24,
+        "Active frame is free, compressed, updating or unsupported",
+    )
+    _require(
+        238 <= total <= length,
+        sqd,
+        offset + 16,
+        "Invalid frame payload lengths",
+    )
+    _require(
+        clen <= total - 238,
+        sqd,
+        offset + 20,
+        "Control block exceeds message payload",
+    )
+    _slice(data, offset + 28, length, sqd)
+    return offset + 28 + int(length)
+
+
 class SquishReader:
     """Validate the active index prefix before returning messages in UID order.
 
@@ -263,9 +371,26 @@ class SquishReader:
         path: str | PathLike[str],
         options: ReaderOptions | None = None,
     ) -> Iterable[ParsedMessage]:
+        options = options or ReaderOptions()
         base = Path(path)
-        sqd, sqi = (_file(base, suffix) for suffix in (".SQD", ".SQI"))
+        try:
+            sqd, sqi = (_file(base, suffix) for suffix in (".SQD", ".SQI"))
+        except _ParseFailure as error:
+            if not options.archive_mode:
+                raise
+            _issue(
+                options,
+                error.path,
+                error.offset,
+                None,
+                "stopped",
+                "framing_invalid",
+                "Ambiguous source files",
+            )
+            return ()
         data, index = sqd.read_bytes(), sqi.read_bytes()
+        if options.archive_mode:
+            return self._archive(data, index, sqd, sqi, options)
         _slice(data, 0, 256, sqd)
         _require(
             struct.unpack_from("<H", data, 0)[0] == 256,
@@ -295,36 +420,8 @@ class SquishReader:
                 "UIDs must be positive, unique and increasing",
             )
             previous = uid
-            _require(
-                offset >= 256,
-                sqi,
-                position * 12,
-                "Frame offset points into base header",
-            )
-            signature, _next, _prev, length, total, clen, kind, _reserved = (
-                _FRAME.unpack(_slice(data, offset, 28, sqd))
-            )
-            _require(signature == 0xAFAE4453, sqd, offset, "Invalid frame signature")
-            _require(
-                kind == 0,
-                sqd,
-                offset + 24,
-                "Active frame is free, compressed, updating or unsupported",
-            )
-            _require(
-                238 <= total <= length,
-                sqd,
-                offset + 16,
-                "Invalid frame payload lengths",
-            )
-            _require(
-                clen <= total - 238,
-                sqd,
-                offset + 20,
-                "Control block exceeds message payload",
-            )
-            _slice(data, offset + 28, length, sqd)
-            frames.append((offset, offset + 28 + length, uid))
+            end = _frame(data, sqd, sqi, position, offset)
+            frames.append((offset, end, uid))
         ranges = sorted(frames)
         for previous_frame, current in zip(ranges, ranges[1:], strict=False):
             _require(
@@ -334,9 +431,138 @@ class SquishReader:
                 "Reused or overlapping active frame",
             )
         return tuple(
-            self._message(data, sqd, offset, uid, options or ReaderOptions())
+            self._message(data, sqd, offset, uid, options)
             for offset, _end, uid in frames
         )
+
+    @staticmethod
+    def _archive(
+        data: bytes,
+        index: bytes,
+        sqd: Path,
+        sqi: Path,
+        options: ReaderOptions,
+    ) -> tuple[ParsedMessage, ...]:
+        try:
+            _slice(data, 0, 256, sqd)
+            _require(
+                struct.unpack_from("<H", data, 0)[0] == 256,
+                sqd,
+                0,
+                "Unsupported base header size",
+            )
+            _require(
+                struct.unpack_from("<H", data, 130)[0] == 28,
+                sqd,
+                130,
+                "Unsupported frame header size",
+            )
+        except _ParseFailure as error:
+            _issue(
+                options,
+                error.path,
+                error.offset,
+                None,
+                "stopped",
+                "framing_invalid",
+                "Invalid or truncated area framing",
+            )
+            return ()
+        count = struct.unpack_from("<I", data, 4)[0]
+        available = len(index) // 12
+        result: list[ParsedMessage] = []
+        previous_uid = 0
+        offsets: set[int] = set()
+        extents: list[tuple[int, int]] = []
+        for position in range(min(count, available)):
+            offset, uid, _hash = _INDEX.unpack_from(index, position * 12)
+            if not previous_uid < uid <= 0xFFFFFFFF:
+                _issue(
+                    options,
+                    sqi,
+                    position * 12 + 4,
+                    uid,
+                    "stopped",
+                    "index_invalid",
+                    "UIDs are not positive, unique and increasing",
+                )
+                return tuple(result)
+            previous_uid = uid
+            if offset in offsets:
+                _issue(
+                    options,
+                    sqi,
+                    position * 12,
+                    uid,
+                    "stopped",
+                    "index_invalid",
+                    "Reused indexed frame offset",
+                )
+                return tuple(result)
+            offsets.add(offset)
+            try:
+                end = _frame(data, sqd, sqi, position, offset)
+            except _ParseFailure as error:
+                _issue(
+                    options,
+                    error.path,
+                    error.offset,
+                    uid,
+                    "skipped",
+                    "record_parse_error",
+                    "Invalid indexed frame",
+                )
+                continue
+            insertion = bisect_left(extents, (offset, end))
+            if (insertion and extents[insertion - 1][1] > offset) or (
+                insertion < len(extents) and extents[insertion][0] < end
+            ):
+                _issue(
+                    options,
+                    sqd,
+                    offset,
+                    uid,
+                    "stopped",
+                    "index_invalid",
+                    "Overlapping indexed frame extents",
+                )
+                return tuple(result)
+            extents.insert(insertion, (offset, end))
+            pending: list[ReaderIssue] = []
+            failure: _ParseFailure | None = None
+            try:
+                message = SquishReader._message(
+                    data, sqd, offset, uid, replace(options, on_issue=pending.append)
+                )
+            except _ParseFailure as error:
+                failure = error
+            # Report outside parser catches, including nested-reader exceptions.
+            for issue in pending:
+                assert options.on_issue is not None
+                options.on_issue(issue)
+            if failure is not None:
+                _issue(
+                    options,
+                    failure.path,
+                    failure.offset,
+                    uid,
+                    "skipped",
+                    "record_parse_error",
+                    "Invalid indexed message metadata or decoding",
+                )
+                continue
+            result.append(message)
+        if available < count or len(index) % 12:
+            _issue(
+                options,
+                sqi,
+                available * 12,
+                None,
+                "stopped",
+                "index_invalid",
+                "Truncated index records",
+            )
+        return tuple(result)
 
     @staticmethod
     def _message(
@@ -349,25 +575,42 @@ class SquishReader:
         fixed = _slice(data, start, 238, path)
         attributes = struct.unpack_from("<I", fixed, 0)[0]
         header_uid = struct.unpack_from("<I", fixed, 214)[0]
+        if attributes & _MSGUID and header_uid != uid and options.archive_mode:
+            _issue(
+                options,
+                path,
+                start + 214,
+                uid,
+                "recovered",
+                "header_uid_mismatch",
+                "Used the authoritative index UID",
+            )
         _require(
-            not attributes & _MSGUID or header_uid == uid,
+            options.archive_mode or not attributes & _MSGUID or header_uid == uid,
             path,
             start + 214,
             "Header UID disagrees with index",
         )
         control_offset = start + 238
         records = _control_records(
-            _slice(data, control_offset, clen, path), path, control_offset
+            _slice(data, control_offset, clen, path), path, control_offset, options, uid
         )
         body_offset = control_offset + clen
         body_raw = _slice(data, body_offset, total - 238 - clen, path)
         charset = _charset(records, body_raw, path, body_offset, options)
-        body = parse_body(_decode(body_raw, charset, path, body_offset))
+        body = parse_body(_decode(body_raw, charset, path, body_offset, options, uid))
         controls, positioned_controls = _controls(
-            records, body, body_raw, charset, path, body_offset
+            records, body, body_raw, charset, path, body_offset, options, uid
         )
         names = [
-            _decode(read_null_padded_field(fixed, o, n), charset, path, start + o)
+            _decode(
+                read_null_padded_field(fixed, o, n),
+                charset,
+                path,
+                start + o,
+                options,
+                uid,
+            )
             for o, n in ((4, 36), (40, 36), (76, 72))
         ]
         addresses: dict[str, int] = {}
