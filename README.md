@@ -2,11 +2,16 @@
 
 Repository: [`golded-ftn-squish-python`](https://github.com/golded-dev/golded-ftn-squish-python).
 The distribution remains `golded-ftn-squish`; imports use `golded_ftn_squish`.
-The source is public on GitHub. This package has not been released on PyPI.
+The source is public on GitHub. [Version 1.2.0 is available on PyPI](https://pypi.org/project/golded-ftn-squish/1.2.0/).
+
+Install with Python 3.12 or newer:
+
+```sh
+python -m pip install golded-ftn-squish==1.2.0
+```
 
 Strict reader and offline writer for classic Squish `.SQD` and `.SQI` message areas. Python 3.12+;
 plain Python, using the models and text helpers from `golded-ftn`.
-Version 1.2.0 is prepared locally; these writer changes are unreleased.
 
 ```python
 from pathlib import Path
