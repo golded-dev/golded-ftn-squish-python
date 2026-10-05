@@ -4,8 +4,9 @@ Repository: [`golded-ftn-squish-python`](https://github.com/golded-dev/golded-ft
 The distribution remains `golded-ftn-squish`; imports use `golded_ftn_squish`.
 The source is public on GitHub. This package has not been released on PyPI.
 
-Strict reader for classic Squish `.SQD` and `.SQI` message areas. Python 3.12+;
+Strict reader and offline writer for classic Squish `.SQD` and `.SQI` message areas. Python 3.12+;
 plain Python, using the models and text helpers from `golded-ftn`.
+Version 1.2.0 is prepared locally; these writer changes are unreleased.
 
 ```python
 from pathlib import Path
@@ -26,7 +27,7 @@ uv sync --locked
 ```
 
 uv uses the sibling `../golded-ftn-python` repository. Wheels and source
-distributions declare only `golded-ftn>=1.1.0,<2`; the development source override
+distributions declare only `golded-ftn>=1.2.0,<2`; the development source override
 and lock file are excluded from the sdist.
 
 ## Reading an area
@@ -82,8 +83,7 @@ frame is an error. `.SQL` lastread data is not used.
 - Provenance records source type `squish`, the actual SQD path, UID as text and
   frame byte offset. Area metadata and other unknown fields remain `None`.
 
-This package reads messages. Writers, area discovery, repairs and databases are
-outside version 1.0.0.
+Area discovery, packing, repair and databases are outside this package.
 
 ## Development
 
@@ -135,3 +135,71 @@ UID order and truncated indices stop traversal. Metadata conflicts are skipped.
 If declared ASCII cannot decode a payload, the configured fallback is tried
 strictly and reported. The original charset control stays unchanged. Other
 decoding failures are skipped; there is no lossy decoding or mojibake repair.
+
+
+## Writing an area
+
+`SquishWriter.create(path)` creates `.SQD`, `.SQI` and an empty `.SQL` lastread
+file. Existing files are rejected. The base header stores the basename, with
+no extension, in its 80-byte name field. The first new UID is 2, following
+GoldED's initialization. Existing `.SQL` bytes remain untouched by editing.
+
+```python
+from pathlib import Path
+
+from golded_ftn import MessagePatch, OutgoingMessage
+from golded_ftn_squish import SquishWriter
+
+writer = SquishWriter()
+Path("messages").mkdir(exist_ok=True)
+writer.create("messages/new-area")
+with writer.open("messages/new-area") as session:
+    created = session.append(
+        OutgoingMessage(
+            from_name="Alice",
+            to_name="Bob",
+            subject="Hello",
+            body_text="Body",
+        )
+    )
+    current = session.read(created.identity.msgno)
+    changed = session.update(
+        current.identity, MessagePatch(subject="Revised"), current.revision
+    )
+    session.delete(changed.identity, changed.revision)
+```
+
+Sessions acquire byte 0 of `.SQD` per operation, reread the whole base and validate
+the physical frames, both linked lists and the active index before writing.
+Revision tokens include the identity, frame offset and raw message bytes;
+neighbor frame links are excluded because an unrelated append changes them.
+A changed or missing target raises `ConflictError`. Unrelated message changes do
+not invalidate the token. Omitted patch fields retain their values; explicit
+`None` clears only fields the format can represent as absent.
+
+Content changes append a new frame and move the old frame to the free list.
+UIDs stay fixed. Free frames are kept for other tools; this writer does not
+recycle, merge or pack them. Header patches preserve omitted raw metadata, all
+nine replies, arrival time, UTC offset and unknown attribute bits. Attribute-only
+changes preserve the original control and text bytes. A body-only patch preserves
+omitted SEEN-BY and PATH routing. Explicit control
+replacement replaces the control block while preserving an omitted `external_id`;
+conflicting MSGID controls are rejected. New names and subjects require room for
+their trailing
+NUL; oversized fields and unencodable text fail instead of being truncated.
+`WriterOptions` selects the strict encoding, CP850 by default. Charset declarations
+must agree when text is serialized. Routing and MSGID are explicit caller data.
+
+One operation is the rollback unit. Injected write, truncate and flush failures
+restore watched files in place under the lock. A failed rollback raises
+`RollbackError` and makes the session unusable. This does not promise recovery
+from process termination or power loss. A configured `maxmsgs` limit rejects an
+append at capacity; editing never purges other messages automatically.
+
+Use Squish offline with GoldED closed. `concurrent=True` is rejected on every
+platform. macOS is the only runtime tested in this checkout. POSIX record locks
+serialize cooperating Python writers; Linux execution remains unverified. Windows
+has
+a byte-lock implementation but has not been exercised here. GoldED build tests,
+concurrent reading and refresh checks are deferred, so no GoldED build is certified.
+See [writer source notes](docs/writer-sources.md).

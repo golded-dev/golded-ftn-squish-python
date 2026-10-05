@@ -7,7 +7,11 @@ from tests._fixtures import area, frame
 
 
 def test_runtime_exports() -> None:
-    assert golded_ftn_squish.__all__ == ["SquishReader"]
+    assert golded_ftn_squish.__all__ == [
+        "SquishReader",
+        "SquishSession",
+        "SquishWriter",
+    ]
     assert (Path(golded_ftn_squish.__file__).parent / "py.typed").is_file()
 
 

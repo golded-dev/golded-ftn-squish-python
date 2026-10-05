@@ -1,6 +1,6 @@
 # golded-ftn-squish
 
-This Python package reads classic Squish areas through golded-ftn models. The
+This Python package reads and edits classic Squish areas through golded-ftn models. The
 base header's active count selects the SQI prefix; ignore its allocated tail.
 Use persistent index UIDs for msgno and reply links. Preserve body separately
 from header controls, and require stable areas during the two file reads.
@@ -8,7 +8,10 @@ from header controls, and require stable areas during the two file reads.
 Validate binary bounds before decoding. Preserve filesystem errors; chain parser
 failures with actual paths and offsets. Decode strictly through core helpers.
 Use synthetic, independently constructed binary fixtures for changed behavior.
-Keep writers, discovery, databases and core changes outside this reader's scope.
+Keep discovery, packing, repair, databases and core changes outside this package.
+Writer operations hold byte 0 of SQD, validate complete chains and preserve raw
+metadata and stable UIDs. Leave lastread files untouched. Concurrent GoldED
+access stays disabled until build, competing-reader and refresh tests pass.
 
 Run README checks and scripts/verify_distribution.py. Distributions use the public
 core dependency; local uv sources belong only to development. Edit this fragment

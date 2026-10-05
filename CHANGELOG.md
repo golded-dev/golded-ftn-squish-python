@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0 — 2026-10-05
+
+Add classic Squish create, append, update and delete sessions. Preserve UIDs and
+raw metadata, maintain active and free chains, validate the complete base before
+mutation, and restore files in place after ordinary write failures. GoldED
+concurrent access remains disabled pending build tests.
+
+Preserve omitted routing during body edits and omitted MSGID during control-block replacement. Reject conflicting MSGID controls.
+
 ## 1.1.0 — Unreleased
 
 Add reported archive reading with index-authoritative UIDs, empty control
