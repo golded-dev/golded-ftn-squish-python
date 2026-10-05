@@ -1,2 +1,2 @@
 66660ebe9569ca36287d7ef4df69b3c7088c950ef44effae09e3ac84102f9855  dist/golded_ftn_squish-1.2.0-py3-none-any.whl
-e71202b799874e4cc16830400e12756db40e41fd79f0c435f0ee238e92e3d13d  dist/golded_ftn_squish-1.2.0.tar.gz
+ae334f240db5cea59dbd2856c75f5e783da3069280658b805800eeb7cc1e891e  dist/golded_ftn_squish-1.2.0.tar.gz
