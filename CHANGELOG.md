@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0 — 2026-10-17
+
+Add a lock-retaining recoverable writer session for Squish `.sqd`/`.sqi` mutation
+with durable prepare/apply/settle recovery. Convert naive local wall time using
+`TZUTC` or a configured IANA area timezone before UTC year bounds. DST gaps and
+folds without explicit `TZUTC` fail closed. Concurrent GoldED access remains
+rejected. Lastread `.sql` files stay untouched.
+
 ## 1.2.0 — 2026-10-05
 
 Add classic Squish create, append, update and delete sessions. Preserve UIDs and

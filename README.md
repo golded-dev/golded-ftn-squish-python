@@ -145,9 +145,12 @@ decoding failures are skipped; there is no lossy decoding or mojibake repair.
 ## Writing an area
 
 `SquishWriter.create(path)` creates `.SQD`, `.SQI` and an empty `.SQL` lastread
-file. Existing files are rejected. The base header stores the basename, with
-no extension, in its 80-byte name field. The first new UID is 2, following
-GoldED's initialization. Existing `.SQL` bytes remain untouched by editing.
+file. Pass `SquishWriterOptions(extension_case="lower")` to create `.sqd` and
+friends instead. Open and read already use the casing that is on disk; both
+casings of the same sidecar at once are still rejected. Existing files are
+rejected. The base header stores the basename, with no extension, in its
+80-byte name field. The first new UID is 2, following GoldED's initialization.
+Existing `.SQL` bytes remain untouched by editing.
 
 ```python
 from pathlib import Path
@@ -201,7 +204,7 @@ restore watched files in place under the lock. A failed rollback raises
 from process termination or power loss. A configured `maxmsgs` limit rejects an
 append at capacity; editing never purges other messages automatically.
 
-Use Squish offline with GoldED closed. `concurrent=True` is rejected on every
+`WriterOptions(concurrent=True)` is accepted. GoldED coexistence is still unverified on every
 platform. macOS is the only runtime tested in this checkout. POSIX record locks
 serialize cooperating Python writers; Linux execution remains unverified. Windows
 has

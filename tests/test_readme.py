@@ -8,9 +8,12 @@ from tests._fixtures import area, frame
 
 def test_runtime_exports() -> None:
     assert golded_ftn_squish.__all__ == [
+        "SquishAdapterError",
         "SquishReader",
+        "SquishRecoverableSession",
         "SquishSession",
         "SquishWriter",
+        "SquishWriterOptions",
     ]
     assert (Path(golded_ftn_squish.__file__).parent / "py.typed").is_file()
 

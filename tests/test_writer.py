@@ -17,13 +17,12 @@ from golded_ftn import (
     OutgoingMessage,
     ParserException,
     RollbackError,
-    UnsupportedOperationError,
     WriterError,
     WriterOptions,
 )
 from golded_ftn._writer_io import IO, locks
 
-from golded_ftn_squish import SquishReader, SquishWriter
+from golded_ftn_squish import SquishAdapterError, SquishReader, SquishWriter
 from tests._fixtures import area, frame, header, patch
 
 
@@ -146,11 +145,14 @@ def test_append_fields_controls_routes_and_uid(tmp_path: Path) -> None:
             outgoing(
                 external_id="2:236/0 abc",
                 from_address=FtnAddress(zone=2, net=236, node=0, point=5),
-                posted_at=datetime(2026, 10, 4, 12, 34, 56, tzinfo=UTC),
+                posted_at=datetime(2026, 10, 4, 12, 34, 56),
                 reply_list=tuple(range(1, 10)),
                 routing_seen_by=("236/0 10",),
                 routing_path=("236/0",),
-                control_lines=(ControlLine(name="PID", value="writer-test", raw=""),),
+                control_lines=(
+                    ControlLine(name="PID", value="writer-test", raw=""),
+                    ControlLine(name="TZUTC", value="0000", raw=""),
+                ),
             )
         )
         assert result.identity.msgno == 2
@@ -178,7 +180,10 @@ def test_append_fields_controls_routes_and_uid(tmp_path: Path) -> None:
         outgoing(attributes_raw=-1),
         outgoing(reply_list=tuple(range(10))),
         outgoing(from_address=FtnAddress(zone=65536, net=0, node=0)),
-        outgoing(posted_at=datetime(1979, 1, 1, tzinfo=UTC)),
+        outgoing(
+            posted_at=datetime(1979, 1, 1),
+            control_lines=(ControlLine(name="TZUTC", value="0000", raw=""),),
+        ),
         outgoing(control_lines=(ControlLine(name="CHRS", value="UTF-8 4", raw=""),)),
     ],
 )
@@ -189,7 +194,7 @@ def test_invalid_input_leaves_base_unchanged(
     before = {path: path.read_bytes() for path in tmp_path.iterdir()}
     with (
         SquishWriter().open(base) as session,
-        pytest.raises((ValueError, UnicodeError)),
+        pytest.raises((SquishAdapterError, ValueError, UnicodeError)),
     ):
         session.append(message)
     assert all(path.read_bytes() == content for path, content in before.items())
@@ -280,7 +285,9 @@ def test_failed_rollback_poison_session(tmp_path: Path) -> None:
 
     base = fixture(tmp_path)
     with SquishWriter(io=BrokenIO()).open(base) as session:
-        with pytest.raises(RollbackError, match="append.*rollback failed"):
+        with pytest.raises(
+            RollbackError, match="Transaction rollback failed during append"
+        ):
             session.append(outgoing())
         with pytest.raises(WriterError, match="unusable"):
             session.read(3)
@@ -309,10 +316,16 @@ def test_lock_timeout_controlled_holder(tmp_path: Path) -> None:
         thread.join(5)
 
 
-def test_concurrent_rejected(tmp_path: Path) -> None:
+def test_concurrent_accepted(tmp_path: Path) -> None:
     base = fixture(tmp_path)
-    with pytest.raises(UnsupportedOperationError):
-        SquishWriter().open(base, WriterOptions(concurrent=True))
+    with SquishWriter().open(base, WriterOptions(concurrent=True)) as session:
+        assert session.options.concurrent is True
+        result = session.append(
+            OutgoingMessage(
+                from_name="Alice", to_name="Bob", subject="Live", body_text="Body"
+            )
+        )
+        assert session.read(result.identity.msgno).message.subject == "Live"
 
 
 def test_two_processes_lock_timeout_and_mutation(tmp_path: Path) -> None:
