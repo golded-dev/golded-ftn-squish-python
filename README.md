@@ -211,3 +211,10 @@ has
 a byte-lock implementation but has not been exercised here. GoldED build tests,
 concurrent reading and refresh checks are deferred, so no GoldED build is certified.
 See [writer source notes](docs/writer-sources.md).
+
+## Candidate 1.3.0
+
+Add recoverable sessions and existing-case resolution. Fix options initialization on Python 3.12; retain stable UIDs, timezone policy and rollback.
+
+Linux and macOS, Python 3.12–3.14, are the release targets. Windows is outside
+this candidate's test and compatibility promises. See [release preparation](docs/release.md).

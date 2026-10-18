@@ -97,9 +97,7 @@ class SquishWriterOptions(WriterOptions):
 def _sidecar_suffixes(options: WriterOptions | None) -> tuple[str, ...]:
     suffixes = (".SQD", ".SQI", ".SQL")
     case = (
-        options.extension_case
-        if isinstance(options, SquishWriterOptions)
-        else "upper"
+        options.extension_case if isinstance(options, SquishWriterOptions) else "upper"
     )
     if case == "lower":
         return tuple(suffix.lower() for suffix in suffixes)

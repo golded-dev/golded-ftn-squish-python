@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.0 (unreleased)
+
+- Add recoverable sessions and existing-case resolution. Fix options initialization on Python 3.12; retain stable UIDs, timezone policy and rollback.
+
 ## 1.3.0 — 2026-10-17
 
 Add a lock-retaining recoverable writer session for Squish `.sqd`/`.sqi` mutation
