@@ -6,12 +6,12 @@ import re
 import stat
 import struct
 from bisect import bisect_left
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from os import PathLike
 from pathlib import Path
-from typing import Literal, NoReturn
+from typing import BinaryIO, Literal, NoReturn
 
 from golded_ftn import (
     ControlLine,
@@ -83,6 +83,24 @@ def _slice(data: bytes, offset: int, length: int, path: Path) -> bytes:
         f"Range of {length} bytes outside file of {len(data)} bytes",
     )
     return data[offset : offset + length]
+
+
+def _read_at(handle: BinaryIO, offset: int, length: int, path: Path) -> bytes:
+    _require(
+        offset >= 0 and length >= 0,
+        path,
+        offset,
+        f"Range of {length} bytes outside file",
+    )
+    handle.seek(offset)
+    data = handle.read(length)
+    _require(
+        len(data) == length,
+        path,
+        offset,
+        f"Range of {length} bytes outside file",
+    )
+    return data
 
 
 def _file(base: Path, suffix: str) -> Path:
@@ -327,7 +345,9 @@ def _date(raw: int, ftsc: bytes) -> datetime | None:
         return None
 
 
-def _frame(data: bytes, sqd: Path, sqi: Path, position: int, offset: int) -> int:
+def _frame_fields(
+    header: bytes, sqd: Path, sqi: Path, position: int, offset: int
+) -> tuple[int, int, int]:
     _require(
         offset >= 256,
         sqi,
@@ -335,7 +355,7 @@ def _frame(data: bytes, sqd: Path, sqi: Path, position: int, offset: int) -> int
         "Frame offset points into base header",
     )
     signature, _next, _prev, length, total, clen, kind, _reserved = _FRAME.unpack(
-        _slice(data, offset, 28, sqd)
+        header
     )
     _require(signature == 0xAFAE4453, sqd, offset, "Invalid frame signature")
     _require(
@@ -356,14 +376,41 @@ def _frame(data: bytes, sqd: Path, sqi: Path, position: int, offset: int) -> int
         offset + 20,
         "Control block exceeds message payload",
     )
+    return int(length), int(total), int(clen)
+
+
+def _frame(
+    data: bytes, sqd: Path, sqi: Path, position: int, offset: int
+) -> tuple[int, int]:
+    length, total, _clen = _frame_fields(
+        _slice(data, offset, 28, sqd), sqd, sqi, position, offset
+    )
     _slice(data, offset + 28, length, sqd)
-    return offset + 28 + int(length)
+    return offset + 28 + length, total
+
+
+def _frame_at(
+    handle: BinaryIO, sqd: Path, sqi: Path, position: int, offset: int, size: int
+) -> tuple[int, int]:
+    length, total, _clen = _frame_fields(
+        _read_at(handle, offset, 28, sqd), sqd, sqi, position, offset
+    )
+    _require(
+        offset + 28 + length <= size,
+        sqd,
+        offset + 28,
+        f"Range of {length} bytes outside file",
+    )
+    return offset + 28 + length, total
 
 
 class SquishReader:
-    """Validate the active index prefix before returning messages in UID order.
+    """Read indexed classic Squish messages in UID order.
 
-    SQD and SQI must be stable; separate reads do not create an atomic snapshot.
+    Default streaming loads the index, then seeks each active frame. Pass
+    ``ReaderOptions(eager=True)`` to load ``.SQD`` and validate every active
+    record before any message is returned. SQD and SQI must be stable; separate
+    reads do not create an atomic snapshot.
     """
 
     def read(
@@ -388,28 +435,91 @@ class SquishReader:
                 "Ambiguous source files",
             )
             return ()
-        data, index = sqd.read_bytes(), sqi.read_bytes()
+        index = sqi.read_bytes()
         if options.archive_mode:
-            return self._archive(data, index, sqd, sqi, options)
-        _slice(data, 0, 256, sqd)
+            return self._archive(sqd.read_bytes(), index, sqd, sqi, options)
+        if options.eager:
+            return self._read_eager(sqd, sqi, index, options)
+        return self._read_stream(sqd, sqi, index, options)
+
+    def _read_eager(
+        self,
+        sqd: Path,
+        sqi: Path,
+        index: bytes,
+        options: ReaderOptions,
+    ) -> tuple[ParsedMessage, ...]:
+        data = sqd.read_bytes()
+        frames = self._active_frames(data, None, sqd, sqi, index)
+        return tuple(
+            self._message(data, sqd, offset, uid, options)
+            for offset, _end, uid, _total in frames
+        )
+
+    def _read_stream(
+        self,
+        sqd: Path,
+        sqi: Path,
+        index: bytes,
+        options: ReaderOptions,
+    ) -> Iterator[ParsedMessage]:
+        handle = sqd.open("rb")
+        try:
+            handle.seek(0, 2)
+            size = handle.tell()
+            # Validate active frames before the caller receives an iterator.
+            frames = self._active_frames(None, handle, sqd, sqi, index, size=size)
+        except BaseException:
+            handle.close()
+            raise
+        return self._iter_frames(handle, sqd, frames, options)
+
+    def _iter_frames(
+        self,
+        handle: BinaryIO,
+        sqd: Path,
+        frames: list[tuple[int, int, int, int]],
+        options: ReaderOptions,
+    ) -> Iterator[ParsedMessage]:
+        try:
+            for offset, _end, uid, total in frames:
+                yield self._message_at(handle, sqd, offset, uid, total, options)
+        finally:
+            handle.close()
+
+    def _active_frames(
+        self,
+        data: bytes | None,
+        handle: BinaryIO | None,
+        sqd: Path,
+        sqi: Path,
+        index: bytes,
+        *,
+        size: int | None = None,
+    ) -> list[tuple[int, int, int, int]]:
+        if data is not None:
+            header = _slice(data, 0, 256, sqd)
+        else:
+            assert handle is not None and size is not None
+            header = _read_at(handle, 0, 256, sqd)
         _require(
-            struct.unpack_from("<H", data, 0)[0] == 256,
+            struct.unpack_from("<H", header, 0)[0] == 256,
             sqd,
             0,
             "Unsupported base header size",
         )
         _require(
-            struct.unpack_from("<H", data, 130)[0] == 28,
+            struct.unpack_from("<H", header, 130)[0] == 28,
             sqd,
             130,
             "Unsupported frame header size",
         )
-        count = struct.unpack_from("<I", data, 4)[0]
+        count = struct.unpack_from("<I", header, 4)[0]
         _require(
             len(index) % 12 == 0, sqi, len(index) // 12 * 12, "Truncated index record"
         )
         _slice(index, 0, count * 12, sqi)
-        frames: list[tuple[int, int, int]] = []
+        frames: list[tuple[int, int, int, int]] = []
         previous = 0
         for position in range(count):
             offset, uid, _hash = _INDEX.unpack_from(index, position * 12)
@@ -420,8 +530,12 @@ class SquishReader:
                 "UIDs must be positive, unique and increasing",
             )
             previous = uid
-            end = _frame(data, sqd, sqi, position, offset)
-            frames.append((offset, end, uid))
+            if data is not None:
+                end, total = _frame(data, sqd, sqi, position, offset)
+            else:
+                assert handle is not None and size is not None
+                end, total = _frame_at(handle, sqd, sqi, position, offset, size)
+            frames.append((offset, end, uid, total))
         ranges = sorted(frames)
         for previous_frame, current in zip(ranges, ranges[1:], strict=False):
             _require(
@@ -430,10 +544,7 @@ class SquishReader:
                 current[0],
                 "Reused or overlapping active frame",
             )
-        return tuple(
-            self._message(data, sqd, offset, uid, options)
-            for offset, _end, uid in frames
-        )
+        return frames
 
     @staticmethod
     def _archive(
@@ -501,7 +612,7 @@ class SquishReader:
                 return tuple(result)
             offsets.add(offset)
             try:
-                end = _frame(data, sqd, sqi, position, offset)
+                end, _total = _frame(data, sqd, sqi, position, offset)
             except _ParseFailure as error:
                 _issue(
                     options,
@@ -564,10 +675,35 @@ class SquishReader:
             )
         return tuple(result)
 
+    def _message_at(
+        self,
+        handle: BinaryIO,
+        path: Path,
+        offset: int,
+        uid: int,
+        total: int,
+        options: ReaderOptions,
+    ) -> ParsedMessage:
+        return self._message(
+            _read_at(handle, offset, 28 + total, path),
+            path,
+            0,
+            uid,
+            options,
+            provenance_offset=offset,
+        )
+
     @staticmethod
     def _message(
-        data: bytes, path: Path, offset: int, uid: int, options: ReaderOptions
+        data: bytes,
+        path: Path,
+        offset: int,
+        uid: int,
+        options: ReaderOptions,
+        *,
+        provenance_offset: int | None = None,
     ) -> ParsedMessage:
+        physical = provenance_offset if provenance_offset is not None else offset
         _signature, _next, _prev, _length, total, clen, _kind, _reserved = (
             _FRAME.unpack_from(data, offset)
         )
@@ -579,7 +715,7 @@ class SquishReader:
             _issue(
                 options,
                 path,
-                start + 214,
+                physical + 28 + 214,
                 uid,
                 "recovered",
                 "header_uid_mismatch",
@@ -588,26 +724,32 @@ class SquishReader:
         _require(
             options.archive_mode or not attributes & _MSGUID or header_uid == uid,
             path,
-            start + 214,
+            physical + 28 + 214,
             "Header UID disagrees with index",
         )
         control_offset = start + 238
+        control_physical = physical + 28 + 238
         records = _control_records(
-            _slice(data, control_offset, clen, path), path, control_offset, options, uid
+            _slice(data, control_offset, clen, path),
+            path,
+            control_physical,
+            options,
+            uid,
         )
         body_offset = control_offset + clen
+        body_physical = control_physical + clen
         body_raw = _slice(data, body_offset, total - 238 - clen, path)
-        charset = _charset(records, body_raw, path, body_offset, options)
-        body = parse_body(_decode(body_raw, charset, path, body_offset, options, uid))
+        charset = _charset(records, body_raw, path, body_physical, options)
+        body = parse_body(_decode(body_raw, charset, path, body_physical, options, uid))
         controls, positioned_controls = _controls(
-            records, body, body_raw, charset, path, body_offset, options, uid
+            records, body, body_raw, charset, path, body_physical, options, uid
         )
         names = [
             _decode(
                 read_null_padded_field(fixed, o, n),
                 charset,
                 path,
-                start + o,
+                physical + 28 + o,
                 options,
                 uid,
             )
@@ -651,6 +793,6 @@ class SquishReader:
                 source_type="squish",
                 source_path=str(path),
                 source_id=str(uid),
-                source_offset=offset,
+                source_offset=physical,
             ),
         )

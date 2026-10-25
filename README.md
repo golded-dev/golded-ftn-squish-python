@@ -2,12 +2,12 @@
 
 Repository: [`golded-ftn-squish-python`](https://github.com/golded-dev/golded-ftn-squish-python).
 The distribution remains `golded-ftn-squish`; imports use `golded_ftn_squish`.
-The source is public on GitHub. [Version 1.2.0 is available on PyPI](https://pypi.org/project/golded-ftn-squish/1.2.0/).
+The source is public on GitHub. [Version 1.3.0 is available on PyPI](https://pypi.org/project/golded-ftn-squish/1.3.0/).
 
 Install with Python 3.12 or newer:
 
 ```sh
-python -m pip install golded-ftn-squish==1.2.0
+python -m pip install golded-ftn-squish==1.3.0
 ```
 
 Strict reader and offline writer for classic Squish `.SQD` and `.SQI` message areas. Python 3.12+;
@@ -32,7 +32,7 @@ uv sync --locked
 ```
 
 uv uses the sibling `../golded-ftn-python` repository. Wheels and source
-distributions declare only `golded-ftn>=1.2.0,<2`; the development source override
+distributions declare only `golded-ftn>=1.4.0,<2`; the development source override
 and lock file are excluded from the sdist.
 
 ## Reading an area
@@ -42,8 +42,11 @@ area basename and optionally core `ReaderOptions(fallback_charset="CP850")`.
 Extensions are matched case-insensitively; ambiguous candidates fail. Both files
 must be regular files. Missing files and wrong file types raise filesystem errors.
 Malformed records and decoding failures raise `ParserException` with the actual
-file path, byte offset and chained cause. All active records are validated before
-the result is returned; a damaged later record never produces a partial result.
+file path, byte offset and chained cause. By default the reader loads the index,
+validates active frame extents, then seeks each frame. Pass
+`ReaderOptions(eager=True)` to load `.SQD` and parse every active message before
+returning a tuple; in eager mode a damaged later record never produces a partial
+result.
 
 Read a stable area without concurrent writes. The two files are read separately,
 without locking: this does not create an atomic snapshot.
@@ -145,9 +148,12 @@ decoding failures are skipped; there is no lossy decoding or mojibake repair.
 ## Writing an area
 
 `SquishWriter.create(path)` creates `.SQD`, `.SQI` and an empty `.SQL` lastread
-file. Existing files are rejected. The base header stores the basename, with
-no extension, in its 80-byte name field. The first new UID is 2, following
-GoldED's initialization. Existing `.SQL` bytes remain untouched by editing.
+file. Pass `SquishWriterOptions(extension_case="lower")` to create `.sqd` and
+friends instead. Open and read already use the casing that is on disk; both
+casings of the same sidecar at once are still rejected. Existing files are
+rejected. The base header stores the basename, with no extension, in its
+80-byte name field. The first new UID is 2, following GoldED's initialization.
+Existing `.SQL` bytes remain untouched by editing.
 
 ```python
 from pathlib import Path
@@ -201,10 +207,29 @@ restore watched files in place under the lock. A failed rollback raises
 from process termination or power loss. A configured `maxmsgs` limit rejects an
 append at capacity; editing never purges other messages automatically.
 
-Use Squish offline with GoldED closed. `concurrent=True` is rejected on every
-platform. macOS is the only runtime tested in this checkout. POSIX record locks
-serialize cooperating Python writers; Linux execution remains unverified. Windows
-has
-a byte-lock implementation but has not been exercised here. GoldED build tests,
-concurrent reading and refresh checks are deferred, so no GoldED build is certified.
-See [writer source notes](docs/writer-sources.md).
+## GoldED compatibility profile
+
+Candidate interoperability is bounded to GoldED source commit `d7449053bd674df54c4a442c92dce8c06ad7b586`,
+version 3.1.0, native macOS arm64/GCC 16 and Ubuntu 24.04 aarch64/GCC 13.
+The suite release manifest pins the resulting binaries and records actual checks.
+Other GoldED versions, Windows and network filesystems are not qualified.
+
+Writers default to offline operation. Explicit `concurrent=True` opts into the
+tested read/write/refresh/lastread/stale-save profile, not a general multiwriter
+guarantee. Standalone readers still need a stable base; a session read uses its
+format lock. MSG/Opus and Goldbase have no shared GoldED writer lock: stale-save
+detection cannot close a race between comparison and a foreign write. Keep
+same-message edits serialized. Goldbase is outside the Python C1 profile.
+
+Use format-specific WriterOptions extension_case="lower" for newly created
+Unix bases used by GoldED; preserve existing casing and reject ambiguous twins.
+Hudson scan queues belong in the configured system directory. Recovery sessions
+have a durable journal protocol; ordinary open() sessions only roll back handled
+I/O failures. UNKNOWN outcomes retain artifacts for operator reconciliation.
+
+## Candidate 1.3.0
+
+Add recoverable sessions and existing-case resolution. Fix options initialization on Python 3.12; retain stable UIDs, timezone policy and rollback.
+
+Linux and macOS, Python 3.12–3.14, are the release targets. Windows is outside
+this candidate's test and compatibility promises. See [release preparation](docs/release.md).

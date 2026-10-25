@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import struct
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import fields
-from datetime import UTC, datetime
+from dataclasses import dataclass, fields
+from datetime import UTC, datetime, timedelta, timezone
 from os import PathLike
 from pathlib import Path
 from types import TracebackType
-from typing import Literal
+from typing import Literal, NoReturn
+from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from golded_ftn import (
     UNSET,
@@ -22,7 +26,11 @@ from golded_ftn import (
     MessageIdentity,
     MessagePatch,
     OutgoingMessage,
+    PhysicalBaseIdentity,
+    PreparedMutation,
     ReaderOptions,
+    RecoveryError,
+    RecoveryOperationKind,
     RevisionToken,
     RollbackError,
     SessionMessage,
@@ -32,12 +40,298 @@ from golded_ftn import (
     WriteResult,
     WriterOptions,
 )
+from golded_ftn._recovery import BaseRecoverableSession, FileMutationPlan, RecoveryStore
 from golded_ftn._writer_io import IO, Transaction, locks, raw_revision, strict_encode
 
 from .reader import _FRAME, _INDEX, SquishReader, _file, _frame, _require, _slice
 
 _SIGNATURE = 0xAFAE4453
 _MSGUID = 0x20000
+_TZUTC_RE = re.compile(r"^([+-]?)(\d{2})(\d{2})$")
+_ADAPTER_MESSAGES = {
+    "dst_gap": "Squish local time falls in a DST gap without TZUTC",
+    "dst_fold": "Squish local time is ambiguous at a DST fold without TZUTC",
+    "aware_datetime": "Squish posted_at must be naive local wall time",
+    "missing_timezone": "Squish posted_at requires TZUTC or an area timezone",
+    "invalid_tzutc": "Invalid TZUTC value",
+    "conflicting_tzutc": "Conflicting TZUTC controls",
+    "year_out_of_range": "Squish UTC date must be in 1980..2069",
+}
+
+
+class SquishAdapterError(ValueError):
+    """A message cannot be represented in Squish; the tosser should HELD it."""
+
+    code: str
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(_ADAPTER_MESSAGES[code])
+
+    def __str__(self) -> str:
+        return _ADAPTER_MESSAGES[self.code]
+
+    def __repr__(self) -> str:
+        return f"SquishAdapterError(code={self.code!r})"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SquishWriterOptions(WriterOptions):
+    timezone: str | None = None
+    extension_case: Literal["upper", "lower"] = "upper"
+
+    def __post_init__(self) -> None:
+        WriterOptions.__post_init__(self)
+        if self.extension_case not in {"upper", "lower"}:
+            raise ValueError("extension_case must be 'upper' or 'lower'")
+        if self.timezone is None:
+            return
+        if not isinstance(self.timezone, str) or not self.timezone.strip():
+            raise ValueError("timezone must be a non-empty IANA name")
+        try:
+            ZoneInfo(self.timezone)
+        except Exception:
+            raise ValueError("Unknown area timezone") from None
+
+
+def _sidecar_suffixes(options: WriterOptions | None) -> tuple[str, ...]:
+    suffixes = (".SQD", ".SQI", ".SQL")
+    case = (
+        options.extension_case if isinstance(options, SquishWriterOptions) else "upper"
+    )
+    if case == "lower":
+        return tuple(suffix.lower() for suffix in suffixes)
+    return suffixes
+
+
+def _configured_timezone(options: WriterOptions) -> str | None:
+    if isinstance(options, SquishWriterOptions):
+        return options.timezone
+    return None
+
+
+def _parse_tzutc(value: str) -> int:
+    match = _TZUTC_RE.fullmatch(value.strip())
+    if match is None:
+        raise SquishAdapterError("invalid_tzutc")
+    sign, hours, minutes = match.groups()
+    hour_i, minute_i = int(hours), int(minutes)
+    if hour_i > 14 or minute_i > 59:
+        raise SquishAdapterError("invalid_tzutc")
+    offset = hour_i * 60 + minute_i
+    return -offset if sign == "-" else offset
+
+
+def _tzutc_minutes(controls: tuple[ControlLine, ...]) -> int | None:
+    found: int | None = None
+    seen = False
+    for control in controls:
+        if control.name.upper() != "TZUTC":
+            continue
+        parsed = _parse_tzutc(control.value)
+        if seen and parsed != found:
+            raise SquishAdapterError("conflicting_tzutc")
+        found = parsed
+        seen = True
+    return found
+
+
+def _tzutc_for_serialize(
+    message: OutgoingMessage | MessagePatch,
+    original_controls: bytes | None,
+) -> int | None:
+    if not isinstance(message.control_lines, Unset):
+        if message.control_lines is None:
+            return None
+        return _tzutc_minutes(message.control_lines)
+    if original_controls is not None:
+        return _tzutc_minutes(_controls(original_controls))
+    if isinstance(message, OutgoingMessage):
+        return _tzutc_minutes(message.control_lines)
+    return None
+
+
+def _localize_wall_time(value: datetime, iana: str) -> datetime:
+    naive = value.replace(tzinfo=None)
+    try:
+        tz = ZoneInfo(iana)
+    except Exception:
+        raise ValueError("Unknown area timezone") from None
+    first = naive.replace(tzinfo=tz, fold=0)
+    second = naive.replace(tzinfo=tz, fold=1)
+    wall_first = first.astimezone(UTC).astimezone(tz).replace(tzinfo=None)
+    wall_second = second.astimezone(UTC).astimezone(tz).replace(tzinfo=None)
+    if wall_first != naive and wall_second != naive:
+        raise SquishAdapterError("dst_gap")
+    if first.utcoffset() != second.utcoffset():
+        raise SquishAdapterError("dst_fold")
+    return first.astimezone(UTC)
+
+
+def _adapt_posted_at(
+    value: datetime,
+    *,
+    tzutc_minutes: int | None,
+    area_timezone: str | None,
+) -> datetime:
+    if value.tzinfo is not None:
+        raise SquishAdapterError("aware_datetime")
+    if tzutc_minutes is not None:
+        offset = timezone(timedelta(minutes=tzutc_minutes))
+        return value.replace(tzinfo=offset).astimezone(UTC)
+    if area_timezone is not None:
+        return _localize_wall_time(value, area_timezone)
+    raise SquishAdapterError("missing_timezone")
+
+
+def _merge_ranges(ranges: list[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if start >= end:
+            continue
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return tuple(merged)
+
+
+def _sqd_write_ranges(old: bytes, new: bytes) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = [(0, min(256, len(new)))]
+    if len(new) > len(old):
+        ranges.append((len(old), len(new)))
+    for offset in range(256, len(old), 256):
+        end = min(offset + 256, len(old), len(new))
+        if end <= offset:
+            continue
+        if new[offset:end] != old[offset:end]:
+            ranges.append((offset, end))
+    return _merge_ranges(ranges)
+
+
+def _sqi_write_ranges(old: bytes, new: bytes) -> tuple[tuple[int, int], ...]:
+    end = max(len(old), len(new))
+    if end == 0:
+        return ()
+    return ((0, end),)
+
+
+def _write_sqd_sqi(
+    io: IO,
+    sqd_fd: int,
+    sqi_fd: int,
+    old: bytes,
+    data: bytearray,
+    index: bytes,
+) -> None:
+    if len(data) > len(old):
+        io.write(sqd_fd, len(old), bytes(data[len(old) :]))
+    for offset in range(256, len(old), 256):
+        chunk = bytes(data[offset : min(offset + 256, len(old))])
+        if chunk != old[offset : offset + len(chunk)]:
+            io.write(sqd_fd, offset, chunk)
+    io.write(sqi_fd, 0, index)
+    io.truncate(sqi_fd, len(index))
+    io.write(sqd_fd, 0, bytes(data[:256]))
+
+
+def _closed_recovery_error(code: str) -> NoReturn:
+    raise RecoveryError(code=code) from None
+
+
+def _locate_recovery_file(base: Path, suffix: str) -> Path:
+    try:
+        candidates = [
+            item
+            for item in base.parent.iterdir()
+            if item.stem == base.name and item.suffix.upper() == suffix
+        ]
+    except OSError:
+        _closed_recovery_error("unsafe_recovery_path")
+    if len(candidates) != 1:
+        raise RecoveryError(code="unsafe_recovery_path")
+    return candidates[0]
+
+
+def _verify_retained_path(path: Path, fd: int) -> None:
+    try:
+        path_stat = os.lstat(path)
+        fd_stat = os.fstat(fd)
+    except OSError:
+        _closed_recovery_error("unsafe_recovery_path")
+    if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
+        raise RecoveryError(code="unsafe_recovery_path")
+    if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
+        raise RecoveryError(code="unsafe_recovery_path")
+
+
+def _open_recovery_file(path: Path) -> int:
+    flags = (
+        os.O_RDWR
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NOCTTY", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        _closed_recovery_error("unsafe_recovery_path")
+    try:
+        _verify_retained_path(path, fd)
+    except RecoveryError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _fsync_directory(path: Path) -> None:
+    if sys.platform == "win32":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        _closed_recovery_error("unexpected_base_modification")
+
+
+def _identity_for(base: Path, uid: int) -> MessageIdentity:
+    return MessageIdentity(format="squish", base=str(base), msgno=uid)
+
+
+def _session_message(
+    data: bytes | bytearray,
+    record: tuple[int, int, int],
+    base: Path,
+    sqd: Path,
+    options: WriterOptions,
+) -> SessionMessage:
+    offset, uid, _hash_value = record
+    _signature, _next, _prev, _length, total, controls, _kind, reserved = (
+        _FRAME.unpack_from(data, offset)
+    )
+    identity = _identity_for(base, uid)
+    raw = bytes(data[offset + 28 : offset + 28 + total])
+    revision = raw_revision(
+        identity,
+        (offset,),
+        struct.pack("<IIIHH", _length, total, controls, _kind, reserved),
+        raw,
+    )
+    return SessionMessage(
+        message=SquishReader._message(
+            bytes(data),
+            sqd,
+            offset,
+            uid,
+            ReaderOptions(fallback_charset=options.target_charset),
+        ),
+        identity=identity,
+        revision=revision,
+    )
 
 
 def _uint(value: int | None, bits: int, name: str) -> int:
@@ -172,16 +466,22 @@ def _control_bytes(controls: tuple[ControlLine, ...], options: WriterOptions) ->
     return bytes(result) + b"\0"
 
 
-def _date(header: bytearray, value: datetime | None) -> None:
+def _date(
+    header: bytearray,
+    value: datetime | None,
+    *,
+    tzutc_minutes: int | None = None,
+    area_timezone: str | None = None,
+) -> None:
     if value is None:
         header[164:168] = b"\0" * 4
         header[218:238] = b"\0" * 20
         return
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("posted_at must have a timezone")
-    date = value.astimezone(UTC)
-    if not 1980 <= date.year <= 2107:
-        raise ValueError("Squish date must be in 1980..2107")
+    date = _adapt_posted_at(
+        value, tzutc_minutes=tzutc_minutes, area_timezone=area_timezone
+    )
+    if not 1980 <= date.year <= 2069:
+        raise SquishAdapterError("year_out_of_range")
     packed = (
         date.day
         | date.month << 5
@@ -219,7 +519,12 @@ def _address(header: bytearray, offset: int, value: FtnAddress | None) -> None:
     values = (
         (0, 0, 0, 0)
         if value is None
-        else (value.zone, value.net, value.node, value.point or 0)
+        else (
+            0 if value.zone is None else value.zone,
+            value.net,
+            value.node,
+            value.point or 0,
+        )
     )
     struct.pack_into(
         "<4H", header, offset, *(_uint(item, 16, "address") for item in values)
@@ -258,7 +563,14 @@ def _serialize(
         if value is not UNSET:
             _address(fixed, offset, value)
     if not isinstance(message.posted_at, Unset):
-        _date(fixed, message.posted_at)
+        _date(
+            fixed,
+            message.posted_at,
+            tzutc_minutes=_tzutc_for_serialize(
+                message, original[1] if original is not None else None
+            ),
+            area_timezone=_configured_timezone(options),
+        )
     if not isinstance(message.reply_to_msgno, Unset):
         struct.pack_into(
             "<I", fixed, 174, _uint(message.reply_to_msgno, 32, "reply_to_msgno")
@@ -410,9 +722,11 @@ class SquishWriter:
     def __init__(self, *, io: IO | None = None) -> None:
         self.io = io or IO()
 
-    def create(self, path: str | PathLike[str]) -> None:
+    def create(
+        self, path: str | PathLike[str], options: WriterOptions | None = None
+    ) -> None:
         base = Path(path)
-        names = [Path(str(base) + suffix) for suffix in (".SQD", ".SQI", ".SQL")]
+        names = [Path(str(base) + suffix) for suffix in _sidecar_suffixes(options)]
         for candidate in base.parent.iterdir():
             if candidate.stem == base.name and candidate.suffix.upper() in {
                 ".SQD",
@@ -453,13 +767,57 @@ class SquishWriter:
     ) -> SquishSession:
         return SquishSession(Path(path), options or WriterOptions(), self.io)
 
+    @contextmanager
+    def recovery_session(
+        self,
+        path: str | PathLike[str],
+        *,
+        recovery_root: str | PathLike[str],
+        options: WriterOptions | None = None,
+    ) -> Iterator[SquishRecoverableSession]:
+        opts = options or WriterOptions()
+        base = Path(path).resolve()
+        sqd = _locate_recovery_file(base, ".SQD")
+        sqi = _locate_recovery_file(base, ".SQI")
+        with locks.acquire(sqd, timeout=opts.lock_timeout) as sqd_fd:
+            _verify_retained_path(sqd, sqd_fd)
+            sqi_fd = _open_recovery_file(sqi)
+            try:
+                lock_stat = os.fstat(sqd_fd)
+                store = RecoveryStore(
+                    physical_base=PhysicalBaseIdentity(
+                        format="squish",
+                        canonical_key=os.path.realpath(sqd),
+                        lock_inode=(lock_stat.st_dev, lock_stat.st_ino),
+                    ),
+                    recovery_root=recovery_root,
+                    base_root=os.path.realpath(sqd.parent),
+                    retained_fds={
+                        ("base", sqd.name): sqd_fd,
+                        ("base", sqi.name): sqi_fd,
+                    },
+                    io=self.io,
+                )
+                session = SquishRecoverableSession(
+                    store=store,
+                    base=base,
+                    sqd=sqd,
+                    sqi=sqi,
+                    sqd_fd=sqd_fd,
+                    sqi_fd=sqi_fd,
+                    options=opts,
+                    io=self.io,
+                )
+                try:
+                    yield session
+                finally:
+                    session.close()
+            finally:
+                os.close(sqi_fd)
+
 
 class SquishSession:
     def __init__(self, base: Path, options: WriterOptions, io: IO) -> None:
-        if options.concurrent:
-            raise UnsupportedOperationError(
-                "Concurrent GoldED access is not verified for Squish"
-            )
         self.base = base.resolve()
         self.options, self.io = options, io
         self.sqd, self.sqi = (_file(self.base, suffix) for suffix in (".SQD", ".SQI"))
@@ -507,34 +865,12 @@ class SquishSession:
                 raise
 
     def _identity(self, uid: int) -> MessageIdentity:
-        return MessageIdentity(format="squish", base=str(self.base), msgno=uid)
+        return _identity_for(self.base, uid)
 
     def _read(
         self, data: bytes | bytearray, record: tuple[int, int, int]
     ) -> SessionMessage:
-        offset, uid, _hash_value = record
-        _signature, _next, _prev, _length, total, controls, _kind, reserved = (
-            _FRAME.unpack_from(data, offset)
-        )
-        identity = self._identity(uid)
-        raw = bytes(data[offset + 28 : offset + 28 + total])
-        revision = raw_revision(
-            identity,
-            (offset,),
-            struct.pack("<IIIHH", _length, total, controls, _kind, reserved),
-            raw,
-        )
-        return SessionMessage(
-            message=SquishReader._message(
-                bytes(data),
-                self.sqd,
-                offset,
-                uid,
-                ReaderOptions(fallback_charset=self.options.target_charset),
-            ),
-            identity=identity,
-            revision=revision,
-        )
+        return _session_message(data, record, self.base, self.sqd, self.options)
 
     def read(self, msgno: int) -> SessionMessage:
         with self._operation() as (_fd, data, records):
@@ -579,15 +915,7 @@ class SquishSession:
             transaction.watch(fd)
             transaction.watch(self._index_fd)
             # Publish payload before chain/index/base changes, all while locked.
-            if len(data) > len(old):
-                self.io.write(fd, len(old), bytes(data[len(old) :]))
-            for offset in range(256, len(old), 256):
-                chunk = bytes(data[offset : min(offset + 256, len(old))])
-                if chunk != old[offset : offset + len(chunk)]:
-                    self.io.write(fd, offset, chunk)
-            self.io.write(self._index_fd, 0, index)
-            self.io.truncate(self._index_fd, len(index))
-            self.io.write(fd, 0, bytes(data[:256]))
+            _write_sqd_sqi(self.io, fd, self._index_fd, old, data, index)
 
     @staticmethod
     def _chain(data: bytearray, offsets: list[int], kind: int) -> None:
@@ -732,3 +1060,217 @@ class SquishSession:
             struct.pack_into("<II", data, 4, len(records), len(records))
             self._commit(fd, old, data, records, "delete")
             return identity
+
+
+def _recipient_hash(fixed: bytes) -> int:
+    return _hash(fixed[40:76]) | (
+        0x80000000 if struct.unpack_from("<I", fixed)[0] & 4 else 0
+    )
+
+
+def _content_fields_changed(patch: MessagePatch) -> bool:
+    return any(
+        getattr(patch, field.name) is not UNSET
+        for field in fields(patch)
+        if field.name
+        in {
+            "from_name",
+            "to_name",
+            "subject",
+            "body_text",
+            "control_lines",
+            "external_id",
+            "routing_seen_by",
+            "routing_path",
+        }
+    )
+
+
+class SquishRecoverableSession(BaseRecoverableSession):
+    def __init__(
+        self,
+        *,
+        store: RecoveryStore,
+        base: Path,
+        sqd: Path,
+        sqi: Path,
+        sqd_fd: int,
+        sqi_fd: int,
+        options: WriterOptions,
+        io: IO,
+    ) -> None:
+        super().__init__(store)
+        self.base = base
+        self.sqd = sqd
+        self.sqi = sqi
+        self._sqd_fd = sqd_fd
+        self._sqi_fd = sqi_fd
+        self.options = options
+        self.io = io
+
+    def _reader_options(self) -> ReaderOptions:
+        return ReaderOptions(fallback_charset=self.options.target_charset)
+
+    def _require_prepare_ready(self) -> None:
+        self.check_usable()
+        self.store.require_binding()
+        if self._active_mutation is not None:
+            self.poison()
+            raise RecoveryError(code="invalid_prepared_mutation")
+        if self.store.pending():
+            raise RecoveryError(code="invalid_prepared_mutation")
+
+    def _load(self) -> tuple[bytearray, bytes, list[tuple[int, int, int]]]:
+        data = bytearray(self.io.read(self._sqd_fd, 0, os.fstat(self._sqd_fd).st_size))
+        index = self.io.read(self._sqi_fd, 0, os.fstat(self._sqi_fd).st_size)
+        records = _validate(
+            bytes(data), index, self.sqd, self.sqi, self._reader_options()
+        )
+        return data, index, records
+
+    def _plans(
+        self, old_sqd: bytes, new_sqd: bytes, old_sqi: bytes, new_sqi: bytes
+    ) -> tuple[FileMutationPlan, FileMutationPlan]:
+        return (
+            FileMutationPlan(
+                role="sqd",
+                rel_path=self.sqd.name,
+                fd=self._sqd_fd,
+                planned_write_ranges=_sqd_write_ranges(old_sqd, new_sqd),
+                post_min_len=min(len(old_sqd), len(new_sqd)),
+                post_max_len=max(len(old_sqd), len(new_sqd)),
+            ),
+            FileMutationPlan(
+                role="sqi",
+                rel_path=self.sqi.name,
+                fd=self._sqi_fd,
+                planned_write_ranges=_sqi_write_ranges(old_sqi, new_sqi),
+                post_min_len=min(len(old_sqi), len(new_sqi)),
+                post_max_len=max(len(old_sqi), len(new_sqi)),
+            ),
+        )
+
+    def _publish(
+        self, old: bytes, data: bytearray, records: list[tuple[int, int, int]]
+    ) -> None:
+        index = b"".join(_INDEX.pack(*record) for record in records)
+        _validate(bytes(data), index, self.sqd, self.sqi, self._reader_options())
+        _write_sqd_sqi(self.io, self._sqd_fd, self._sqi_fd, old, data, index)
+        self.io.flush(self._sqd_fd)
+        self.io.flush(self._sqi_fd)
+        _fsync_directory(self.sqd.parent)
+
+    def read(self, msgno: int) -> SessionMessage:
+        self.check_usable()
+        data, _index, records = self._load()
+        for record in records:
+            if record[1] == msgno:
+                return _session_message(data, record, self.base, self.sqd, self.options)
+        raise ConflictError("Squish message does not exist")
+
+    def prepare_append(
+        self, transaction_id: UUID, message: OutgoingMessage
+    ) -> PreparedMutation:
+        self._require_prepare_ready()
+        _serialize(message, 1, self.options)
+        data, old_index, records = self._load()
+        old = bytes(data)
+        uid = struct.unpack_from("<I", data, 20)[0]
+        if uid >= 0xFFFFFFFF:
+            raise ValueError("Squish UID space exhausted")
+        maximum = struct.unpack_from("<I", data, 124)[0]
+        if maximum and len(records) >= maximum:
+            raise UnsupportedOperationError(
+                "Squish maxmsgs reached; automatic purge is outside writer scope"
+            )
+        fixed, controls, body = _serialize(message, uid, self.options)
+        offset = SquishSession._append_frame(data, fixed, controls, body)
+        records.append((offset, uid, _recipient_hash(fixed)))
+        SquishSession._chain(data, [record[0] for record in records], 0)
+        struct.pack_into("<II", data, 4, len(records), len(records))
+        struct.pack_into("<I", data, 20, uid + 1)
+        new_index = b"".join(_INDEX.pack(*record) for record in records)
+        _validate(bytes(data), new_index, self.sqd, self.sqi, self._reader_options())
+        result_record = records[-1]
+
+        def apply_fn() -> WriteResult:
+            self._publish(old, data, records)
+            result = _session_message(
+                data, result_record, self.base, self.sqd, self.options
+            )
+            return WriteResult(identity=result.identity, revision=result.revision)
+
+        return self.register_prepared_mutation(
+            transaction_id,
+            RecoveryOperationKind.APPEND,
+            self._plans(old, bytes(data), old_index, new_index),
+            apply_fn,
+        )
+
+    def prepare_update(
+        self,
+        transaction_id: UUID,
+        identity: MessageIdentity,
+        patch: MessagePatch,
+        expected_revision: RevisionToken,
+    ) -> PreparedMutation:
+        self._require_prepare_ready()
+        data, old_index, records = self._load()
+        if identity != _identity_for(self.base, identity.msgno) or (
+            expected_revision.identity != identity
+        ):
+            raise ConflictError("Squish identity belongs to another base")
+        position = None
+        for index, record in enumerate(records):
+            if record[1] == identity.msgno:
+                current = _session_message(
+                    data, record, self.base, self.sqd, self.options
+                )
+                if current.revision != expected_revision:
+                    raise ConflictError("Squish message changed")
+                position = index
+                break
+        if position is None:
+            raise ConflictError("Squish message disappeared")
+        old = bytes(data)
+        offset, uid, _old_hash = records[position]
+        values = _FRAME.unpack_from(data, offset)
+        start, control_length, total = offset + 28, values[5], values[4]
+        raw = bytes(data[start : start + total])
+        fixed, controls, body = _serialize(
+            patch,
+            uid,
+            self.options,
+            (
+                raw[:238],
+                raw[238 : 238 + control_length],
+                raw[238 + control_length :],
+            ),
+        )
+        if _content_fields_changed(patch):
+            free = SquishSession._free(data)
+            new_offset = SquishSession._append_frame(data, fixed, controls, body)
+            records[position] = (new_offset, uid, 0)
+            SquishSession._chain(data, free + [offset], 1)
+            SquishSession._chain(data, [record[0] for record in records], 0)
+        else:
+            data[start : start + 238] = fixed
+            new_offset = offset
+        records[position] = (new_offset, uid, _recipient_hash(fixed))
+        new_index = b"".join(_INDEX.pack(*record) for record in records)
+        _validate(bytes(data), new_index, self.sqd, self.sqi, self._reader_options())
+        result_record = records[position]
+
+        def apply_fn() -> WriteResult:
+            self._publish(old, data, records)
+            result = _session_message(
+                data, result_record, self.base, self.sqd, self.options
+            )
+            return WriteResult(identity=result.identity, revision=result.revision)
+
+        return self.register_prepared_mutation(
+            transaction_id,
+            RecoveryOperationKind.UPDATE,
+            self._plans(old, bytes(data), old_index, new_index),
+            apply_fn,
+        )
