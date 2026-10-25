@@ -340,6 +340,20 @@ def test_read_returns_no_partial_messages(tmp_path: Path) -> None:
         SquishReader().read(base)
 
 
+def test_streaming_default_yields_without_eager_tuple(tmp_path: Path) -> None:
+    messages = SquishReader().read(area(tmp_path, frames=((3, frame()),)))
+    assert not isinstance(messages, tuple)
+    assert [item.body_text for item in messages] == ["Hello\nworld"]
+
+
+def test_eager_returns_tuple(tmp_path: Path) -> None:
+    messages = SquishReader().read(
+        area(tmp_path, frames=((3, frame()),)), ReaderOptions(eager=True)
+    )
+    assert isinstance(messages, tuple)
+    assert messages[0].body_text == "Hello\nworld"
+
+
 def test_short_base_header(tmp_path: Path) -> None:
     base = area(tmp_path)
     Path(str(base) + ".SQD").write_bytes(b"\x00" * 255)

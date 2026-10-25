@@ -519,7 +519,12 @@ def _address(header: bytearray, offset: int, value: FtnAddress | None) -> None:
     values = (
         (0, 0, 0, 0)
         if value is None
-        else (value.zone, value.net, value.node, value.point or 0)
+        else (
+            0 if value.zone is None else value.zone,
+            value.net,
+            value.node,
+            value.point or 0,
+        )
     )
     struct.pack_into(
         "<4H", header, offset, *(_uint(item, 16, "address") for item in values)

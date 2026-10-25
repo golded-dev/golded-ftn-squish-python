@@ -19,7 +19,7 @@ def test_archive_ignores_empty_segments_with_issues(tmp_path: Path) -> None:
         tmp_path, frames=((3, frame(control=b"\x01PID: test\x01\x01MSGID: test\x01")),)
     )
     with pytest.raises(ParserException):
-        SquishReader().read(base)
+        SquishReader().read(base, ReaderOptions(eager=True))
     issues: list[ReaderIssue] = []
     messages = tuple(
         SquishReader().read(
@@ -53,7 +53,7 @@ def test_archive_ascii_fallback(tmp_path: Path) -> None:
     body = "Ø".encode("cp850")
     base = area(tmp_path, frames=((3, frame(control=control, body=body)),))
     with pytest.raises(ParserException):
-        SquishReader().read(base)
+        SquishReader().read(base, ReaderOptions(eager=True))
     issues: list[ReaderIssue] = []
     (message,) = tuple(
         SquishReader().read(
