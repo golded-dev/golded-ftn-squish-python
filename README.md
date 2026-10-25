@@ -2,12 +2,12 @@
 
 Repository: [`golded-ftn-squish-python`](https://github.com/golded-dev/golded-ftn-squish-python).
 The distribution remains `golded-ftn-squish`; imports use `golded_ftn_squish`.
-The source is public on GitHub. [Version 1.2.0 is available on PyPI](https://pypi.org/project/golded-ftn-squish/1.2.0/).
+The source is public on GitHub. [Version 1.3.0 is available on PyPI](https://pypi.org/project/golded-ftn-squish/1.3.0/).
 
 Install with Python 3.12 or newer:
 
 ```sh
-python -m pip install golded-ftn-squish==1.2.0
+python -m pip install golded-ftn-squish==1.3.0
 ```
 
 Strict reader and offline writer for classic Squish `.SQD` and `.SQI` message areas. Python 3.12+;
@@ -32,7 +32,7 @@ uv sync --locked
 ```
 
 uv uses the sibling `../golded-ftn-python` repository. Wheels and source
-distributions declare only `golded-ftn>=1.2.0,<2`; the development source override
+distributions declare only `golded-ftn>=1.4.0,<2`; the development source override
 and lock file are excluded from the sdist.
 
 ## Reading an area
@@ -42,8 +42,11 @@ area basename and optionally core `ReaderOptions(fallback_charset="CP850")`.
 Extensions are matched case-insensitively; ambiguous candidates fail. Both files
 must be regular files. Missing files and wrong file types raise filesystem errors.
 Malformed records and decoding failures raise `ParserException` with the actual
-file path, byte offset and chained cause. All active records are validated before
-the result is returned; a damaged later record never produces a partial result.
+file path, byte offset and chained cause. By default the reader loads the index,
+validates active frame extents, then seeks each frame. Pass
+`ReaderOptions(eager=True)` to load `.SQD` and parse every active message before
+returning a tuple; in eager mode a damaged later record never produces a partial
+result.
 
 Read a stable area without concurrent writes. The two files are read separately,
 without locking: this does not create an atomic snapshot.

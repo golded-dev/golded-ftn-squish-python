@@ -1,16 +1,16 @@
 # Changelog
 
-## 1.3.0 (unreleased)
+## 1.3.0 — 2026-10-25
 
-- Add recoverable sessions and existing-case resolution. Fix options initialization on Python 3.12; retain stable UIDs, timezone policy and rollback.
-
-## 1.3.0 — 2026-10-17
-
-Add a lock-retaining recoverable writer session for Squish `.sqd`/`.sqi` mutation
-with durable prepare/apply/settle recovery. Convert naive local wall time using
-`TZUTC` or a configured IANA area timezone before UTC year bounds. DST gaps and
-folds without explicit `TZUTC` fail closed. Concurrent GoldED access remains
-rejected. Lastread `.sql` files stay untouched.
+- Add recoverable sessions and existing-case resolution. Retain stable UIDs,
+  timezone policy and rollback.
+- Add lock-retaining Squish `.sqd`/`.sqi` mutation with durable
+  prepare/apply/settle recovery.
+- Convert naive local wall time using `TZUTC` or a configured IANA area timezone
+  before UTC year bounds. DST gaps and folds without explicit `TZUTC` fail closed.
+- Fix options initialization on Python 3.12. Concurrent GoldED access remains
+  rejected. Lastread `.sql` files stay untouched.
+- Require `golded-ftn>=1.4.0,<2`.
 
 ## 1.2.0 — 2026-10-05
 
