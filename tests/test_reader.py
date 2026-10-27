@@ -63,7 +63,7 @@ def test_full_message(tmp_path: Path) -> None:
         message.provenance.source_id,
         message.provenance.source_offset,
     ) == ("squish", str(base) + ".SQD", "3", 256)
-    assert message.area_code is message.area_name is None
+    assert message.area is message.area_name is None
 
 
 def test_index_authority_and_allocated_tail(tmp_path: Path) -> None:
@@ -246,7 +246,7 @@ def test_decode_control_precedence_and_body_metadata(tmp_path: Path) -> None:
         )
     )
     assert message.from_name == "Åse" and message.body_text.endswith("Æøå")
-    assert message.external_id == "same" and message.area_code is None
+    assert message.external_id == "same" and message.area is None
     assert message.control_lines is not None
     assert message.control_lines.seen_by == ("236/1",)
     assert len([c for c in message.control_lines.kludges if c.name == "MSGID"]) == 3
