@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.0 — Unreleased
+
+- Add an opt-in archive reader option that returns messages with conflicting
+  MSGIDs using the index UID, preserves the control lines, and reports the
+  conflict without choosing an external identity.
+- Add read-only diagnostics that report physical offsets of unlinked frames.
+- Let offline writers opt into appending past unlinked frames while retaining
+  strict index and chain validation. Preserve unlinked frame bytes and allocate
+  new UIDs above the orphaned message UIDs. Updates and deletes remain strict.
+
 ## 1.3.0 — 2026-10-25
 
 - Add recoverable sessions and existing-case resolution. Retain stable UIDs,

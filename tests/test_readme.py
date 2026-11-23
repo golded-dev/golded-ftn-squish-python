@@ -10,6 +10,7 @@ def test_runtime_exports() -> None:
     assert golded_ftn_squish.__all__ == [
         "SquishAdapterError",
         "SquishReader",
+        "SquishReaderOptions",
         "SquishRecoverableSession",
         "SquishSession",
         "SquishWriter",

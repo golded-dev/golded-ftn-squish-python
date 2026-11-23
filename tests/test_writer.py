@@ -513,3 +513,26 @@ def test_control_patch_preserves_omitted_external_id(tmp_path: Path) -> None:
                 current.revision,
             )
         assert Path(str(base) + ".SQD").read_bytes() == before
+
+
+def test_append_preserves_unlinked_frames(tmp_path: Path) -> None:
+    from golded_ftn_squish import SquishWriterOptions
+
+    base = fixture(tmp_path)
+    sqd = base.with_suffix(".SQD")
+    original = sqd.read_bytes()
+    orphan = frame(fixed=header(uid=150, attributes=0x20000))
+    sqd.write_bytes(original + orphan)
+    patch(sqd, 120, "<i", len(original) + len(orphan))
+    writer = SquishWriter()
+    assert writer.unlinked_frame_offsets(base) == (len(original),)
+    with writer.open(base) as session, pytest.raises(ParserException, match="Unlinked"):
+        session.append(outgoing())
+    with writer.open(base, SquishWriterOptions(allow_unlinked_append=True)) as session:
+        assert session.append(outgoing()).identity.msgno == 151
+        assert session.append(outgoing(reply_to_msgno=151)).identity.msgno == 152
+    assert sqd.read_bytes()[len(original) : len(original) + len(orphan)] == orphan
+    assert [(m.msgno, m.reply_to_msgno) for m in SquishReader().read(base)][-2:] == [
+        (151, None),
+        (152, 151),
+    ]

@@ -1,4 +1,4 @@
-from .reader import SquishReader
+from .reader import SquishReader, SquishReaderOptions
 from .writer import (
     SquishAdapterError,
     SquishRecoverableSession,
@@ -10,6 +10,7 @@ from .writer import (
 __all__ = [
     "SquishAdapterError",
     "SquishReader",
+    "SquishReaderOptions",
     "SquishRecoverableSession",
     "SquishSession",
     "SquishWriter",
