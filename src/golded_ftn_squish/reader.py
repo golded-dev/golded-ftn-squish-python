@@ -7,7 +7,7 @@ import stat
 import struct
 from bisect import bisect_left
 from collections.abc import Iterable, Iterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from os import PathLike
 from pathlib import Path
@@ -34,6 +34,16 @@ from ._metadata import AddressError, parse_date, resolve_addresses
 _INDEX = struct.Struct("<iII")
 _FRAME = struct.Struct("<IiiIIIHH")
 _MSGUID = 0x20000
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SquishReaderOptions(ReaderOptions):
+    display_msgid_conflict: bool = False
+
+    def __post_init__(self) -> None:
+        ReaderOptions.__post_init__(self)
+        if self.display_msgid_conflict and not self.archive_mode:
+            raise ValueError("display_msgid_conflict requires archive_mode")
 
 
 class _ParseFailure(ParserException):
@@ -272,7 +282,7 @@ def _controls(
     body_offset: int,
     options: ReaderOptions,
     uid: int,
-) -> tuple[MessageControlLines, list[tuple[ControlLine, int]]]:
+) -> tuple[MessageControlLines, list[tuple[ControlLine, int]], bool]:
     decoded_records = [
         (_decode(raw, charset, path, offset, options, uid), offset)
         for raw, offset in records
@@ -301,21 +311,41 @@ def _controls(
         if control.name in positions:
             offset = next(positions[control.name], body_offset)
             positioned_controls.append((control, offset))
+    msgid_conflict = False
     for control, offset in positioned_controls:
-        if control.name in {"MSGID", "REPLY"}:
-            _require(
-                control.name not in seen or seen[control.name] == control.value,
-                path,
-                offset,
-                f"Conflicting {control.name} values",
-            )
-            seen[control.name] = control.value
+        if control.name not in {"MSGID", "REPLY"}:
+            continue
+        previous = seen.setdefault(control.name, control.value)
+        if previous == control.value:
+            continue
+        if (
+            control.name == "MSGID"
+            and isinstance(options, SquishReaderOptions)
+            and options.display_msgid_conflict
+        ):
+            if not msgid_conflict:
+                _issue(
+                    options,
+                    path,
+                    offset,
+                    uid,
+                    "recovered",
+                    "conflicting_msgid",
+                    "Displayed message without assigning a conflicting MSGID",
+                )
+            msgid_conflict = True
+            continue
+        _fail(path, offset, ValueError(f"Conflicting {control.name} values"))
     combined = replace(
         body_controls,
         kludges=header_controls.kludges + body_controls.kludges,
-        msgid=header_controls.msgid
-        if header_controls.msgid is not None
-        else body_controls.msgid,
+        msgid=None
+        if msgid_conflict
+        else (
+            header_controls.msgid
+            if header_controls.msgid is not None
+            else body_controls.msgid
+        ),
         reply=header_controls.reply
         if header_controls.reply is not None
         else body_controls.reply,
@@ -325,7 +355,7 @@ def _controls(
         seen_by=header_controls.seen_by + body_controls.seen_by,
         path=header_controls.path + body_controls.path,
     )
-    return combined, positioned_controls
+    return combined, positioned_controls, msgid_conflict
 
 
 def _date(raw: int, ftsc: bytes) -> datetime | None:
@@ -741,7 +771,7 @@ class SquishReader:
         body_raw = _slice(data, body_offset, total - 238 - clen, path)
         charset = _charset(records, body_raw, path, body_physical, options)
         body = parse_body(_decode(body_raw, charset, path, body_physical, options, uid))
-        controls, positioned_controls = _controls(
+        controls, positioned_controls, msgid_conflict = _controls(
             records, body, body_raw, charset, path, body_physical, options, uid
         )
         names = [
@@ -771,7 +801,7 @@ class SquishReader:
         date = _date(written, fixed[218:238])
         reply_to, first_reply = struct.unpack_from("<II", fixed, 174)
         external_id = controls.msgid
-        if external_id is None:
+        if external_id is None and not msgid_conflict:
             external_id = synthetic_id(
                 names[0], names[1], names[2], date.isoformat() if date else None, body
             )

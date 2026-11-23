@@ -78,6 +78,7 @@ class SquishAdapterError(ValueError):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SquishWriterOptions(WriterOptions):
     timezone: str | None = None
+    allow_unlinked_append: bool = False
     extension_case: Literal["upper", "lower"] = "upper"
 
     def __post_init__(self) -> None:
@@ -360,6 +361,8 @@ def _validate(
     sqd: Path,
     sqi: Path,
     options: ReaderOptions | None = None,
+    *,
+    unlinked: dict[int, int] | None = None,
 ) -> list[tuple[int, int, int]]:
     _slice(data, 0, 256, sqd)
     _require(struct.unpack_from("<H", data)[0] == 256, sqd, 0, "Unsupported base size")
@@ -434,7 +437,15 @@ def _validate(
             _require(
                 chain == active, sqd, first_offset, "Active chain disagrees with index"
             )
-    _require(seen == set(physical), sqd, 104, "Unlinked physical frame")
+    for offset in sorted(physical.keys() - seen):
+        _require(unlinked is not None, sqd, offset, "Unlinked physical frame")
+        if unlinked is not None:
+            frame = physical[offset]
+            uid = 0
+            if frame[6] == 0:
+                _require(frame[4] >= 238, sqd, offset, "Short unlinked message header")
+                uid = struct.unpack_from("<I", data, offset + 28 + 214)[0]
+            unlinked[offset] = uid
     return records
 
 
@@ -762,6 +773,14 @@ class SquishWriter:
                 target.unlink()
             raise
 
+    def unlinked_frame_offsets(self, path: str | PathLike[str]) -> tuple[int, ...]:
+        """Inspect a stable base without write access; return physical offsets."""
+        base = Path(path)
+        sqd, sqi = (_file(base, suffix) for suffix in (".SQD", ".SQI"))
+        unlinked: dict[int, int] = {}
+        _validate(sqd.read_bytes(), sqi.read_bytes(), sqd, sqi, unlinked=unlinked)
+        return tuple(unlinked)
+
     def open(
         self, path: str | PathLike[str], options: WriterOptions | None = None
     ) -> SquishSession:
@@ -843,7 +862,9 @@ class SquishSession:
             self._closed = True
 
     @contextmanager
-    def _operation(self) -> Iterator[tuple[int, bytearray, list[tuple[int, int, int]]]]:
+    def _operation(
+        self, *, unlinked: dict[int, int] | None = None
+    ) -> Iterator[tuple[int, bytearray, list[tuple[int, int, int]]]]:
         if self._closed or self._poisoned:
             raise WriterError(
                 "Squish session is closed or unusable after failed rollback"
@@ -857,6 +878,7 @@ class SquishSession:
                 self.sqd,
                 self.sqi,
                 ReaderOptions(fallback_charset=self.options.target_charset),
+                unlinked=unlinked,
             )
             try:
                 yield fd, bytearray(data), records
@@ -902,15 +924,21 @@ class SquishSession:
         data: bytearray,
         records: list[tuple[int, int, int]],
         operation: str,
+        *,
+        unlinked: dict[int, int] | None = None,
     ) -> None:
         index = b"".join(_INDEX.pack(*record) for record in records)
+        resulting_unlinked: dict[int, int] | None = {} if unlinked is not None else None
         _validate(
             bytes(data),
             index,
             self.sqd,
             self.sqi,
             ReaderOptions(fallback_charset=self.options.target_charset),
+            unlinked=resulting_unlinked,
         )
+        if resulting_unlinked != unlinked:
+            raise WriterError("Squish append changed the unlinked frame set")
         with Transaction(self.io, str(self.base), operation) as transaction:
             transaction.watch(fd)
             transaction.watch(self._index_fd)
@@ -948,9 +976,17 @@ class SquishSession:
     def append(self, message: OutgoingMessage) -> WriteResult:
         # Validate model before touching the base.
         _serialize(message, 1, self.options)
-        with self._operation() as (fd, data, records):
+        unlinked: dict[int, int] | None = (
+            {}
+            if isinstance(self.options, SquishWriterOptions)
+            and self.options.allow_unlinked_append
+            else None
+        )
+        with self._operation(unlinked=unlinked) as (fd, data, records):
             old = bytes(data)
             uid = struct.unpack_from("<I", data, 20)[0]
+            if unlinked:
+                uid = max(uid, max(unlinked.values()) + 1)
             if uid >= 0xFFFFFFFF:
                 raise ValueError("Squish UID space exhausted")
             maximum = struct.unpack_from("<I", data, 124)[0]
@@ -971,7 +1007,7 @@ class SquishSession:
             self._chain(data, [record[0] for record in records], 0)
             struct.pack_into("<II", data, 4, len(records), len(records))
             struct.pack_into("<I", data, 20, uid + 1)
-            self._commit(fd, old, data, records, "append")
+            self._commit(fd, old, data, records, "append", unlinked=unlinked)
             result = self._read(data, records[-1])
             return WriteResult(identity=result.identity, revision=result.revision)
 

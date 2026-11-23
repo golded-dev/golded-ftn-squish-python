@@ -169,3 +169,37 @@ def test_archive_ascii_fallback_accepts_core_alias(tmp_path: Path) -> None:
     )[0]
     assert message.body_text == "é"
     assert [i.code for i in issues] == ["ascii_decode_fallback"]
+
+
+def test_archive_can_display_conflicting_msgid_without_identity(tmp_path: Path) -> None:
+    from golded_ftn_squish import SquishReaderOptions
+
+    base = area(
+        tmp_path,
+        frames=((3, frame(control=b"\x01MSGID: first\x01MSGID: second")),),
+    )
+    issues: list[ReaderIssue] = []
+    reader = SquishReader()
+    assert (
+        tuple(
+            reader.read(base, ReaderOptions(archive_mode=True, on_issue=issues.append))
+        )
+        == ()
+    )
+    assert [issue.action for issue in issues] == ["skipped"]
+    issues.clear()
+    (message,) = reader.read(
+        base,
+        SquishReaderOptions(
+            archive_mode=True, on_issue=issues.append, display_msgid_conflict=True
+        ),
+    )
+    assert message.msgno == 3
+    assert message.body_text == "Hello\nworld"
+    assert message.external_id is None
+    assert message.control_lines is not None
+    assert message.control_lines.msgid is None
+    assert [line.value for line in message.control_lines.kludges] == ["first", "second"]
+    assert [(issue.action, issue.code) for issue in issues] == [
+        ("recovered", "conflicting_msgid")
+    ]

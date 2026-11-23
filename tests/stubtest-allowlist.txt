@@ -1,3 +1,4 @@
 # Runtime typing representations only: Literal aliases and inherited dataclass slots.
 # Public callable signatures remain checked. No function or class-wide suppression.
 golded_ftn_squish\.writer\.SquishWriterOptions\.__slots__
+golded_ftn_squish\.reader\.SquishReaderOptions\.__slots__

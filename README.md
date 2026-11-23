@@ -145,6 +145,11 @@ strictly and reported. The original charset control stays unchanged. Other
 decoding failures are skipped; there is no lossy decoding or mojibake repair.
 
 
+In archive mode, `SquishReaderOptions(display_msgid_conflict=True, archive_mode=True,
+on_issue=...)` displays indexed messages with conflicting MSGIDs. It retains
+the raw control lines, assigns no external identity and reports one
+`conflicting_msgid` recovery per displayed message.
+
 ## Writing an area
 
 `SquishWriter.create(path)` creates `.SQD`, `.SQI` and an empty `.SQL` lastread
@@ -201,6 +206,12 @@ NUL; oversized fields and unencodable text fail instead of being truncated.
 `WriterOptions` selects the strict encoding, CP850 by default. Charset declarations
 must agree when text is serialized. Routing and MSGID are explicit caller data.
 
+For ordinary offline sessions, `SquishWriterOptions(allow_unlinked_append=True)`
+allows appending to a structurally valid base with unlinked physical frames.
+The writer still validates the index, both chains and physical boundaries. It
+leaves unlinked frames intact and allocates UIDs above their message UIDs.
+Updates, deletes and recoverable sessions retain strict validation.
+
 One operation is the rollback unit. Injected write, truncate and flush failures
 restore watched files in place under the lock. A failed rollback raises
 `RollbackError` and makes the session unusable. This does not promise recovery
@@ -227,9 +238,11 @@ Hudson scan queues belong in the configured system directory. Recovery sessions
 have a durable journal protocol; ordinary open() sessions only roll back handled
 I/O failures. UNKNOWN outcomes retain artifacts for operator reconciliation.
 
-## Candidate 1.3.0
+## Candidate 1.4.0
 
-Add recoverable sessions and existing-case resolution. Fix options initialization on Python 3.12; retain stable UIDs, timezone policy and rollback.
+Add optional display of conflicting MSGIDs in archive mode, diagnose unlinked
+frames without opening a writer, and allow opt-in offline append past unlinked
+frames.
 
 Linux and macOS, Python 3.12–3.14, are the release targets. Windows is outside
 this candidate's test and compatibility promises. See [release preparation](docs/release.md).
